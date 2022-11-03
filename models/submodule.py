@@ -176,6 +176,41 @@ def disparity_regression(x, maxdisp):
     disp_values = disp_values.view(1, maxdisp, 1, 1)
     return torch.sum(x * disp_values, 1, keepdim=False)
 
+def deconv(in_planes, out_planes):
+    return nn.Sequential(
+        nn.ConvTranspose2d(in_planes, out_planes, kernel_size=4, stride=2, padding=1, bias=False),
+        nn.LeakyReLU(0.1,inplace=True)
+    )
+
+class ResBlock(nn.Module):
+    def __init__(self, n_in, n_out, stride=1):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv2d(n_in, n_out, kernel_size=3, stride=stride, padding=1)
+        self.bn1 = nn.BatchNorm2d(n_out)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(n_out, n_out, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(n_out)
+
+        if stride != 1 or n_out != n_in:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(n_in, n_out, kernel_size=1, stride=stride),
+                nn.BatchNorm2d(n_out))
+        else:
+            self.shortcut = None
+
+    def forward(self, x):
+        residual = x
+        if self.shortcut is not None:
+            residual = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+
+        out += residual
+        out = self.relu(out)
+        return out
 
 def build_concat_volume(refimg_fea, targetimg_fea, maxdisp):
     B, C, H, W = refimg_fea.shape
@@ -190,6 +225,17 @@ def build_concat_volume(refimg_fea, targetimg_fea, maxdisp):
     volume = volume.contiguous()
     return volume
 
+def build_corr(img_left, img_right, max_disp=48,step=1):
+    B, C, H, W = img_left.shape
+    volume = img_left.new_zeros([B, max_disp, H, W])
+    for i in range(max_disp):
+        if i > 0:
+            volume[:, i, :, i*step:] = (img_left[:, :, :, i*step:] * img_right[:, :, :, :-i*step]).mean(dim=1)
+        else:
+            volume[:, i, :, :] = (img_left[:, :, :, :] * img_right[:, :, :, :]).mean(dim=1)
+
+    volume = volume.contiguous()
+    return volume
 
 def build_gwc_volume_cos(refimg_fea, targetimg_fea, maxdisp, num_groups):
     refimg_fea = refimg_fea/(torch.sum(refimg_fea**2, dim=1,keepdim=True).pow(1/2)+1e-05)
@@ -539,5 +585,51 @@ def groupwise_correlation_4D(fea1, fea2, num_groups):
     assert cost.shape == (B, num_groups, D, H, W)
     return cost
 
-        
+
+
+
+def cost_from_disp(x, y, disp_range_samples,mode="corrlation"):
+    assert (x.is_contiguous() == True)
+    _,ndisp,_,_=disp_range_samples.size()
+    bs, channels, height, width = x.size()
+    if mode=="corrlation":
+
+        cost = x.new().resize_(bs, channels , ndisp, height, width).zero_()
+    else:
+        cost=x.new().resize_(bs, channels*2 , ndisp, height, width).zero_()
+
+    mh, mw = torch.meshgrid([torch.arange(0, height, dtype=x.dtype, device=x.device),
+                                torch.arange(0, width, dtype=x.dtype, device=x.device)])  # (H *W)
+    mh = mh.reshape(1, 1, height, width).repeat(bs, ndisp, 1, 1)
+    mw = mw.reshape(1, 1, height, width).repeat(bs, ndisp, 1, 1)  # (B, D, H, W)
+
+    cur_disp_coords_y = mh
+    cur_disp_coords_x = mw - disp_range_samples
+
+    coords_x = cur_disp_coords_x / ((width - 1.0) / 2.0) - 1.0  # trans to -1 - 1
+    coords_y = cur_disp_coords_y / ((height - 1.0) / 2.0) - 1.0
+    grid = torch.stack([coords_x, coords_y], dim=4)   #(B, D, H, W, 2)
+
+    if mode=="concat":
+        cost[:, x.size()[1]:, :, :, :] = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
+                                                           padding_mode='zeros',align_corners=True).view(bs, channels, ndisp, height, width)
+        tmp = x.unsqueeze(2).repeat(1, 1, ndisp, 1, 1) #(B, C, D, H, W)
+        cost[:, :x.size()[1], :, :, :] = tmp
+    elif mode=="corrlation":
+        cost[:, :, :, :, :] = F.grid_sample(y, grid.view(bs, ndisp * height, width, 2), mode='bilinear',
+                                                           padding_mode='zeros',align_corners=True).view(bs, channels, ndisp, height, width)
+        tmp = x.unsqueeze(2).repeat(1, 1, ndisp, 1, 1) #(B, C, D, H, W)
+        cost=(cost*tmp).mean(dim=1)
+        cost=torch.squeeze(cost,dim=1)
+    else:
+        AssertionError
+
+    return cost
+
+if __name__=='__main__':
+    cost=torch.randn([1,4,2,2])
+    cost=F.softmax(cost,dim=1)
+    print(cost)
+
+
 
